@@ -87,7 +87,7 @@
     "@replit/codemirror-indentation-markers": "^6.5.3",
     "@replit/codemirror-vim": "^6.3.0",
     "@types/swagger-ui-dist": "^3.30.6",
-    "@uiw/codemirror-theme-gruvbox-dark": "^4.25.9",
+    "@uiw/codemirror-theme-gruvbox-dark": "^4.25.10",
     "@vue-leaflet/vue-leaflet": "^0.10.1",
     "@vueuse/core": "^14.3.0",
     "blockly": "^11.2.2",
