@@ -60,7 +60,8 @@ public class UIServlet extends HttpServlet {
     public static final String SERVLET_PATH = "/";
     private static final String STATIC_PATH = "/static";
     private static final String STATIC_BASE = OpenHAB.getConfigFolder() + "/html";
-    private static final List<String> COMPRESS_EXT = List.of("br", "gz");
+    // precompressed variants in order of preference, mapping the file extension to the HTTP content-coding
+    private static final List<Encoding> ENCODINGS = List.of(new Encoding("br", "br"), new Encoding("gz", "gzip"));
 
     private final UIContext uiContext;
     private final long bundleModifiedTime;
@@ -98,15 +99,19 @@ public class UIServlet extends HttpServlet {
             return;
         }
 
+        response.setHeader("Vary", "Accept-Encoding");
+        if (resource.lastModified > 0) {
+            response.setDateHeader("Last-Modified", resource.lastModified);
+            if (isNotModified(request, resource.lastModified)) {
+                response.setStatus(HttpServletResponse.SC_NOT_MODIFIED);
+                return;
+            }
+        }
         if (resource.contentType != null) {
             response.setContentType(resource.contentType);
         }
         if (resource.contentEncoding != null) {
             response.setHeader("Content-Encoding", resource.contentEncoding);
-            response.setHeader("Vary", "Accept-Encoding");
-        }
-        if (resource.lastModified > 0) {
-            response.setDateHeader("Last-Modified", resource.lastModified);
         }
         if (resource.contentLength >= 0) {
             response.setContentLengthLong(resource.contentLength);
@@ -115,6 +120,29 @@ public class UIServlet extends HttpServlet {
         try (InputStream is = resource.url.openStream()) {
             is.transferTo(response.getOutputStream());
         }
+    }
+
+    private boolean isNotModified(HttpServletRequest request, long lastModified) {
+        try {
+            long ifModifiedSince = request.getDateHeader("If-Modified-Since");
+            // HTTP dates have a resolution of one second
+            return ifModifiedSince >= 0 && ifModifiedSince >= (lastModified / 1000) * 1000;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private static boolean accepts(@Nullable String acceptEncoding, String coding) {
+        if (acceptEncoding == null) {
+            return false;
+        }
+        for (String part : acceptEncoding.split(",")) {
+            String[] params = part.split(";");
+            if (params[0].trim().equalsIgnoreCase(coding)) {
+                return params.length < 2 || !params[1].trim().matches("q=0(\\.0{0,3})?");
+            }
+        }
+        return false;
     }
 
     private @Nullable ResourceDescriptor resolveResource(String requestPath, @Nullable String acceptEncoding) {
@@ -138,16 +166,14 @@ public class UIServlet extends HttpServlet {
             return null;
         }
 
-        if (acceptEncoding != null) {
-            for (String ext : COMPRESS_EXT) {
-                if (acceptEncoding.contains(ext)) {
-                    File compressed = new File(file.getPath() + "." + ext);
-                    if (compressed.exists()) {
-                        URL compressedUrl = fileUrl(compressed);
-                        if (compressedUrl != null) {
-                            return new ResourceDescriptor(compressedUrl, contentType(requestPath), ext,
-                                    compressed.length(), compressed.lastModified());
-                        }
+        for (Encoding encoding : ENCODINGS) {
+            if (accepts(acceptEncoding, encoding.coding())) {
+                File compressed = new File(file.getPath() + "." + encoding.extension());
+                if (compressed.exists()) {
+                    URL compressedUrl = fileUrl(compressed);
+                    if (compressedUrl != null) {
+                        return new ResourceDescriptor(compressedUrl, contentType(requestPath), encoding.coding(),
+                                compressed.length(), compressed.lastModified());
                     }
                 }
             }
@@ -169,20 +195,18 @@ public class UIServlet extends HttpServlet {
 
     private @Nullable ResourceDescriptor resolveBundleResource(String bundlePath, String requestPath,
             @Nullable String acceptEncoding) {
-        if (acceptEncoding != null) {
-            for (String ext : COMPRESS_EXT) {
-                if (acceptEncoding.contains(ext)) {
-                    URL compressed = uiContext.getResource(bundlePath + "." + ext);
-                    if (compressed != null) {
-                        return new ResourceDescriptor(compressed, contentType(requestPath), ext, -1,
-                                bundleModifiedTime);
-                    }
+        for (Encoding encoding : ENCODINGS) {
+            if (accepts(acceptEncoding, encoding.coding())) {
+                URL compressed = uiContext.getResource(bundlePath + "." + encoding.extension());
+                if (compressed != null) {
+                    return new ResourceDescriptor(compressed, contentType(requestPath), encoding.coding(), -1,
+                            bundleModifiedTime);
                 }
             }
         }
 
         URL resource = uiContext.getResource(bundlePath);
-        if (resource == null && COMPRESS_EXT.stream().noneMatch(requestPath::endsWith)) {
+        if (resource == null && ENCODINGS.stream().noneMatch(e -> requestPath.endsWith("." + e.extension()))) {
             // Missing resources should return 404 so the error page servlet can handle SPA routes.
             return null;
         }
@@ -196,6 +220,9 @@ public class UIServlet extends HttpServlet {
             contentType = URLConnection.guessContentTypeFromName(path);
         }
         return contentType;
+    }
+
+    private record Encoding(String extension, String coding) {
     }
 
     private record ResourceDescriptor(URL url, @Nullable String contentType, @Nullable String contentEncoding,
