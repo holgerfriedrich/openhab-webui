@@ -145,7 +145,7 @@
     "@csstools/postcss-global-data": "^4.0.0",
     "@eslint/compat": "^2.1.1",
     "@eslint/eslintrc": "^3.3.6",
-    "@hey-api/openapi-ts": "^0.98.2",
+    "@hey-api/openapi-ts": "^0.99.0",
     "@intlify/eslint-plugin-vue-i18n": "^4.5.1",
     "@lezer/generator": "^1.8.1",
     "@tsconfig/node24": "^24.0.5",
