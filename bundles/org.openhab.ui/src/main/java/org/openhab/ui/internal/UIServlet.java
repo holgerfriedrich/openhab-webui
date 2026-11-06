@@ -15,10 +15,15 @@ package org.openhab.ui.internal;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.eclipse.jdt.annotation.NonNullByDefault;
 import org.eclipse.jdt.annotation.Nullable;
@@ -44,6 +49,7 @@ import jakarta.servlet.http.HttpServletResponse;
  *
  * @author Yannick Schaus - Initial contribution
  * @author Dan Cunningham - Convert file serving to a custom servlet
+ * @author Holger Friedrich - Serve files without Jetty DefaultServlet, support range requests
  */
 @Component(immediate = true, service = Servlet.class, name = "org.openhab.ui")
 @NonNullByDefault
@@ -58,17 +64,24 @@ public class UIServlet extends HttpServlet {
 
     private static final String APP_BASE = "app";
     public static final String SERVLET_PATH = "/";
-    private static final String STATIC_PATH = "/static";
-    private static final String STATIC_BASE = OpenHAB.getConfigFolder() + "/html";
+    private static final String STATIC_PATH = "/static/";
     // precompressed variants in order of preference, mapping the file extension to the HTTP content-coding
     private static final List<Encoding> ENCODINGS = List.of(new Encoding("br", "br"), new Encoding("gz", "gzip"));
+    // a single byte range; multiple ranges are not supported and the complete resource is served instead
+    private static final Pattern BYTE_RANGE = Pattern.compile("bytes=(\\d*)-(\\d*)");
 
     private final UIContext uiContext;
+    private final Path staticBase;
     private final long bundleModifiedTime;
 
     @Activate
     public UIServlet(final @Reference UIContext uiContext) {
+        this(uiContext, Path.of(OpenHAB.getConfigFolder(), "html"));
+    }
+
+    UIServlet(UIContext uiContext, Path staticBase) {
         this.uiContext = uiContext;
+        this.staticBase = staticBase.toAbsolutePath().normalize();
         logger.debug("Starting up {} at {}", getClass().getSimpleName(), SERVLET_PATH);
         bundleModifiedTime = (System.currentTimeMillis() / 1000) * 1000; // round milliseconds
     }
@@ -85,11 +98,10 @@ public class UIServlet extends HttpServlet {
             return;
         }
 
-        String requestPath = request.getRequestURI().substring(request.getContextPath().length());
-        if (requestPath.isEmpty()) {
-            requestPath = SERVLET_PATH;
-        }
-        if (SERVLET_PATH.equals(requestPath)) {
+        // the path info is decoded and normalized by the container, unlike the raw request URI, so ".." segments
+        // cannot be used to leave the served directories
+        String requestPath = request.getPathInfo();
+        if (requestPath == null || requestPath.isEmpty() || SERVLET_PATH.equals(requestPath)) {
             requestPath = "/index.html";
         }
 
@@ -113,12 +125,103 @@ public class UIServlet extends HttpServlet {
         if (resource.contentEncoding != null) {
             response.setHeader("Content-Encoding", resource.contentEncoding);
         }
-        if (resource.contentLength >= 0) {
-            response.setContentLengthLong(resource.contentLength);
+        long length = resource.contentLength;
+        ByteRange range = null;
+        if (length >= 0) {
+            response.setHeader("Accept-Ranges", "bytes");
+            String rangeHeader = request.getHeader("Range");
+            if (rangeHeader != null && isRangeApplicable(request, resource.lastModified)) {
+                range = parseRange(rangeHeader, length);
+            }
+        }
+
+        if (range == ByteRange.UNSATISFIABLE) {
+            response.setHeader("Content-Range", "bytes */" + length);
+            // not sendError(), which would dispatch to the error page servlet and serve the UI instead
+            response.setStatus(HttpServletResponse.SC_REQUESTED_RANGE_NOT_SATISFIABLE);
+            return;
+        }
+        if (range != null) {
+            response.setStatus(HttpServletResponse.SC_PARTIAL_CONTENT);
+            response.setHeader("Content-Range", "bytes " + range.first() + "-" + range.last() + "/" + length);
+            response.setContentLengthLong(range.length());
+        } else if (length >= 0) {
+            response.setContentLengthLong(length);
         }
 
         try (InputStream is = resource.url.openStream()) {
-            is.transferTo(response.getOutputStream());
+            if (range == null) {
+                is.transferTo(response.getOutputStream());
+            } else {
+                is.skipNBytes(range.first());
+                copy(is, response.getOutputStream(), range.length());
+            }
+        }
+    }
+
+    private static void copy(InputStream in, OutputStream out, long count) throws IOException {
+        byte[] buffer = new byte[8192];
+        long remaining = count;
+        while (remaining > 0) {
+            int read = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+            if (read < 0) {
+                break;
+            }
+            out.write(buffer, 0, read);
+            remaining -= read;
+        }
+    }
+
+    /**
+     * Checks the If-Range precondition. No ETags are sent, so only an HTTP date matching the last modification time
+     * allows a partial response.
+     */
+    private boolean isRangeApplicable(HttpServletRequest request, long lastModified) {
+        if (request.getHeader("If-Range") == null) {
+            return true;
+        }
+        try {
+            return request.getDateHeader("If-Range") == (lastModified / 1000) * 1000;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Parses a Range header according to RFC 9110, section 14.1.2.
+     *
+     * @return the requested range, {@link ByteRange#UNSATISFIABLE} if no byte of the resource is selected, or null if
+     *         the header is invalid or requests multiple ranges and the complete resource should be served
+     */
+    static @Nullable ByteRange parseRange(String header, long length) {
+        Matcher matcher = BYTE_RANGE.matcher(header.trim());
+        if (!matcher.matches()) {
+            return null;
+        }
+        String first = matcher.group(1);
+        String last = matcher.group(2);
+        try {
+            if (first.isEmpty()) {
+                if (last.isEmpty()) {
+                    return null;
+                }
+                long suffixLength = Long.parseLong(last);
+                if (suffixLength == 0 || length == 0) {
+                    return ByteRange.UNSATISFIABLE;
+                }
+                return new ByteRange(Math.max(0, length - suffixLength), length - 1);
+            }
+            long start = Long.parseLong(first);
+            long end = last.isEmpty() ? Long.MAX_VALUE : Long.parseLong(last);
+            if (end < start) {
+                return null;
+            }
+            if (start >= length) {
+                return ByteRange.UNSATISFIABLE;
+            }
+            return new ByteRange(start, Math.min(end, length - 1));
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 
@@ -160,8 +263,16 @@ public class UIServlet extends HttpServlet {
     }
 
     private @Nullable ResourceDescriptor resolveStaticResource(String requestPath, @Nullable String acceptEncoding) {
-        String relativePath = requestPath.substring(STATIC_PATH.length());
-        File file = new File(STATIC_BASE + relativePath);
+        Path path;
+        try {
+            path = staticBase.resolve(requestPath.substring(STATIC_PATH.length())).normalize();
+        } catch (InvalidPathException e) {
+            return null;
+        }
+        if (!path.startsWith(staticBase)) {
+            return null;
+        }
+        File file = path.toFile();
         if (file.isDirectory() || !file.exists()) {
             return null;
         }
@@ -227,5 +338,13 @@ public class UIServlet extends HttpServlet {
 
     private record ResourceDescriptor(URL url, @Nullable String contentType, @Nullable String contentEncoding,
             long contentLength, long lastModified) {
+    }
+
+    record ByteRange(long first, long last) {
+        static final ByteRange UNSATISFIABLE = new ByteRange(-1, -1);
+
+        long length() {
+            return last - first + 1;
+        }
     }
 }
